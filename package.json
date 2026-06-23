@@ -1,0 +1,15 @@
+{
+  "name": "eduquiz-whatsapp-bot",
+  "version": "1.0.0",
+  "description": "Always-on WhatsApp sender for EduQuiz, using a real WhatsApp Web session (no Meta approval needed).",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.9",
+    "express": "^4.19.2",
+    "qrcode": "^1.5.3",
+    "pino": "^9.0.0"
+  }
+}
