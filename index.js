@@ -53,6 +53,15 @@ async function startSock() {
 
   sock.ev.on('creds.update', saveCreds);
 
+  // Track delivery status of messages we send: PENDING(0) -> SERVER_ACK(1,
+  // accepted by WhatsApp's servers) -> DELIVERY_ACK(2, reached the phone) ->
+  // READ(3, opened). This is the real proof of what happened after "sent".
+  sock.ev.on('messages.update', (updates) => {
+    for (const u of updates) {
+      console.log(`[whatsapp-bot] Message ${u.key?.id} status update:`, u.update?.status);
+    }
+  });
+
   sock.ev.on('connection.update', async (update) => {
     const { connection, lastDisconnect, qr } = update;
 
@@ -130,8 +139,21 @@ app.post('/send', async (req, res) => {
     if (digits.startsWith('0')) digits = '20' + digits.slice(1); // assume Egypt if a local-format number slips through
     const jid = `${digits}@s.whatsapp.net`;
 
-    await sock.sendMessage(jid, { text: message });
-    res.json({ success: true });
+    // Ask WhatsApp directly whether this number actually has an account,
+    // BEFORE attempting to send. This is the real proof - sendMessage()
+    // succeeding does NOT mean the number is valid.
+    const [check] = await sock.onWhatsApp(jid);
+    console.log(`[whatsapp-bot] onWhatsApp check for ${phone}:`, check);
+    if (!check || !check.exists) {
+      return res.status(404).json({
+        success: false,
+        error: `Number ${phone} does not appear to have an active WhatsApp account (per WhatsApp's own servers).`,
+      });
+    }
+
+    const sent = await sock.sendMessage(check.jid, { text: message });
+    console.log(`[whatsapp-bot] Sent. Message key:`, sent?.key);
+    res.json({ success: true, messageId: sent?.key?.id || null });
   } catch (err) {
     console.error('[whatsapp-bot] Send failed:', err);
     res.status(500).json({ success: false, error: err.message || 'Unknown error' });
