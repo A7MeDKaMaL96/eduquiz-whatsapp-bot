@@ -24,6 +24,7 @@
 const express = require('express');
 const qrcode = require('qrcode');
 const pino = require('pino');
+const fs = require('fs');
 const {
   default: makeWASocket,
   useMultiFileAuthState,
@@ -41,6 +42,25 @@ let isConnected = false;
 
 const logger = pino({ level: 'silent' }); // keep Render logs clean; set to 'info' to debug
 
+// Disconnect reasons that mean "this session is broken, clear it and force a
+// fresh QR scan" - NOT just loggedOut. connectionReplaced/badSession/
+// multideviceMismatch all happen when a different phone number gets linked
+// while old session files are still around, and blindly retrying forever
+// (the old behavior) just loops without ever fixing itself.
+const NEEDS_FRESH_LOGIN = new Set([
+  DisconnectReason.loggedOut,
+  DisconnectReason.connectionReplaced,
+  DisconnectReason.badSession,
+  DisconnectReason.multideviceMismatch,
+]);
+
+function clearAuthFolder() {
+  if (fs.existsSync(AUTH_FOLDER)) {
+    fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
+    console.log('[whatsapp-bot] Cleared stale auth_session folder.');
+  }
+}
+
 async function startSock() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
   const { version } = await fetchLatestBaileysVersion();
@@ -53,9 +73,6 @@ async function startSock() {
 
   sock.ev.on('creds.update', saveCreds);
 
-  // Track delivery status of messages we send: PENDING(0) -> SERVER_ACK(1,
-  // accepted by WhatsApp's servers) -> DELIVERY_ACK(2, reached the phone) ->
-  // READ(3, opened). This is the real proof of what happened after "sent".
   sock.ev.on('messages.update', (updates) => {
     for (const u of updates) {
       console.log(`[whatsapp-bot] Message ${u.key?.id} status update:`, u.update?.status);
@@ -79,12 +96,18 @@ async function startSock() {
     if (connection === 'close') {
       isConnected = false;
       const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const loggedOut = statusCode === DisconnectReason.loggedOut;
-      console.log(`[whatsapp-bot] Connection closed (loggedOut=${loggedOut}). Reconnecting...`);
-      if (!loggedOut) {
-        startSock(); // auto-reconnect unless the session was explicitly logged out
+      const reasonName = Object.keys(DisconnectReason).find((k) => DisconnectReason[k] === statusCode) || 'unknown';
+      const needsReset = NEEDS_FRESH_LOGIN.has(statusCode);
+
+      console.log(`[whatsapp-bot] Connection closed. statusCode=${statusCode} reason=${reasonName} needsReset=${needsReset}`);
+
+      if (needsReset) {
+        console.log('[whatsapp-bot] Session is broken (likely a different number was linked, or logged out). Clearing session and waiting for a fresh QR scan.');
+        clearAuthFolder();
+        startSock(); // this will now generate a clean new QR, since auth_session is gone
       } else {
-        console.log('[whatsapp-bot] Logged out - delete the auth_session folder and rescan the QR code.');
+        console.log('[whatsapp-bot] Transient disconnect - reconnecting with existing session...');
+        startSock();
       }
     }
   });
@@ -101,6 +124,22 @@ app.use(express.json());
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', connected: isConnected });
+});
+
+app.post('/reset', (req, res) => {
+  const providedKey = req.header('X-API-Key') || '';
+  if (!API_KEY || providedKey !== API_KEY) {
+    return res.status(401).json({ success: false, error: 'Invalid or missing API key' });
+  }
+  console.log('[whatsapp-bot] Manual reset requested - clearing session for a new phone number.');
+  if (sock) {
+    try { sock.end(undefined); } catch (e) { /* ignore */ }
+  }
+  clearAuthFolder();
+  isConnected = false;
+  latestQrDataUrl = null;
+  startSock();
+  res.json({ success: true, message: 'Session cleared. Visit /qr to scan with the new number.' });
 });
 
 app.get('/qr', (req, res) => {
